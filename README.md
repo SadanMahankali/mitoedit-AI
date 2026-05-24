@@ -1,4 +1,4 @@
-# MitoEdit AI
+# Revitalize AI
 
 **AI-driven simulation platform for doxycycline-inducible CRISPR prime editing of mitochondrial DNA via the PNPase RNA-import pathway.**
 
@@ -21,6 +21,24 @@ Built for the Caltech Hackathon.
 
 - **Backend** — Python 3.9, FastAPI, PyTorch, SciPy ODE, Optuna
 - **Frontend** — Next.js 16 (App Router, Turbopack), TypeScript, Tailwind v4, react-three-fiber, Recharts, Zustand, Framer Motion, Lucide
+
+## AI Co-Scientist (Claude integration)
+
+Three Claude-powered endpoints, all using `claude-opus-4-7` with adaptive thinking + prompt caching on the science primer:
+
+| Endpoint     | What it does                                                                                            |
+|--------------|---------------------------------------------------------------------------------------------------------|
+| `/interpret` | Streams a biologist-style explanation of the latest simulation (mechanism, rate-limiter, caveats).      |
+| `/protocol`  | Streams a day-by-day wet-lab protocol (materials, controls, readouts) tailored to the optimizer result. |
+| `/scenario`  | Tool-use parse: natural-language scenario → structured simulator params (region, het, dosing schedule). |
+
+**Set up the key:**
+```bash
+cp backend/.env.example backend/.env
+# edit backend/.env and paste your sk-ant-... key
+```
+
+The AI panel appears in the right column of the dashboard.
 
 ## Run locally
 

@@ -1,0 +1,401 @@
+"""Anthropic Claude integration for Revitalize AI.
+
+Three capabilities:
+  1. `stream_interpretation(...)` — biologist-style explanation of a simulation
+     result. Streams tokens; uses prompt caching on the long science primer.
+  2. `stream_protocol(...)` — generates a wet-lab protocol Markdown document
+     from an optimizer result + guide design. Streams tokens.
+  3. `parse_scenario(...)` — converts a natural-language scenario description
+     into structured simulator params via Claude tool use.
+
+All endpoints use Claude Opus 4.7 with adaptive thinking. The long system
+prompts are marked `cache_control: ephemeral` so repeated calls within a
+5-minute window are ~10x cheaper after the first request.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Iterator
+
+import anthropic
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
+
+MODEL = "claude-opus-4-7"
+
+
+def _client() -> anthropic.Anthropic:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY not set. Copy backend/.env.example to .env and add your key."
+        )
+    return anthropic.Anthropic(api_key=key)
+
+
+# ---------------------------------------------------------------------------
+# Shared science primer — cached across requests
+# ---------------------------------------------------------------------------
+
+SCIENCE_PRIMER = """You are a senior mitochondrial biologist and gene-therapy expert
+advising on Revitalize AI, a computational platform that designs and simulates
+doxycycline-inducible CRISPR prime editing of mitochondrial DNA (mtDNA) using the
+PNPase RNA-import pathway.
+
+System architecture you understand intimately:
+
+1. SAFE-HARBOR INTEGRATION. A doxycycline-inducible cassette encoding a modified
+   prime editor (Cas9 nickase + reverse transcriptase) plus a pegRNA and a guide
+   RNA is integrated at a genomic safe-harbor locus (e.g. AAVS1) via CRISPR/Cas9.
+
+2. DOX INDUCTION. The Tet-On promoter drives transcription of the cassette in a
+   doxycycline-dose-dependent manner, following Hill kinetics:
+       dM/dt = V_max * [D]^n / (K_d^n + [D]^n) - k_deg_m * M
+   In Revitalize's ODE, K_d = 0.6 (a.u.), n = 2.
+
+3. RNP ASSEMBLY. Translation yields the editor protein, which assembles with the
+   pegRNA into a ribonucleoprotein complex bearing an N-terminal mitochondrial
+   targeting signal (MTS) and a PNPase-recognition tag.
+
+4. PNPase IMPORT. Polynucleotide phosphorylase on the outer mitochondrial
+   membrane imports the tagged RNP into the matrix — this is THE rate-limiting
+   step. Native PNPase imports tRNAs and 5S rRNA in humans; engineered tags
+   based on the H1-RNA stem-loop have been shown to drive heterologous RNA
+   import (Wang et al, Cell 2010).
+
+5. mtDNA EDITING. Inside the matrix, the prime editor installs a base swap at
+   the target site (e.g. m.3243A>G reversion for MELAS). Because mtDNA exists
+   at ~1000 copies per cell with mixed wild-type / pathogenic load
+   (heteroplasmy), the edit progressively shifts the heteroplasmy ratio.
+
+6. HETEROPLASMY DYNAMICS. The phenotypic threshold for MELAS, NARP, and LHON is
+   ~60-80% pathogenic mtDNA. Even a modest shift toward WT (e.g. 80% → 50%)
+   often produces dramatic clinical rescue ("threshold effect").
+
+Key pathogenic loci you advise on:
+   - MT-TL1 m.3243A>G  — MELAS syndrome
+   - MT-ATP6 m.8993T>G — NARP / Leigh syndrome
+   - MT-ND1 m.3460G>A  — LHON
+   - MT-ND4 m.11778G>A — LHON
+
+ML predictor: the platform uses a small CNN over one-hot encoded guide+pegRNA
+sequence to predict on-target efficiency and off-target risk, with features
+including GC content, PBS Tm (Wallace rule), homopolymer runs, and seed-region
+purine bias (Doench-style).
+
+ODE simulator state vector: D (dox), M (mRNA), P (cytosolic RNP), I (mito RNP),
+H (edited fraction), AUC (dox exposure for toxicity).
+
+Optimizer: Optuna TPE search over (n_doses, interval_h, bolus_amount, start_h)
+minimising  α·(residual pathogenic) + β·(dox AUC) + γ·(time-to-rescue)."""
+
+
+# ---------------------------------------------------------------------------
+# 1. Result interpretation (streaming)
+# ---------------------------------------------------------------------------
+
+def stream_interpretation(
+    region: dict,
+    design: dict,
+    prediction: dict,
+    simulation: dict,
+) -> Iterator[str]:
+    """Stream a biologist-style interpretation of a simulation run."""
+    sim_summary = _summarise_sim(simulation)
+    user_msg = f"""A simulation has just completed. Provide a concise, biologist-style
+interpretation (3-4 short paragraphs) suitable for a research seminar:
+
+TARGET LOCUS
+  {region.get('name', 'unknown')}  ({region.get('disease', '')})
+  Variant: m.{region.get('position')}{region.get('wt')}>{region.get('edit')}
+
+GUIDE DESIGN (auto-generated by Revitalize)
+  Spacer (gRNA):   {design['spacer']}
+  PAM:             {design['pam']}
+  pegRNA 3' ext:   {design['pegrna_3p']}
+
+ML PREDICTOR OUTPUT
+  Predicted on-target efficiency: {prediction['on_target']*100:.1f}%
+  Predicted off-target risk:      {prediction['off_target_risk']*100:.1f}%
+  Spacer GC content:              {prediction['gc_content']*100:.0f}%
+  PBS Tm (Wallace):               {prediction['pbs_tm']:.0f} °C
+
+SIMULATION RESULT
+{sim_summary}
+
+Cover, in order:
+  1. **What the simulation predicts biologically** — translate the heteroplasmy
+     trajectory into expected clinical outcome (mitochondrial function, ATP
+     synthesis, threshold-effect rescue).
+  2. **Mechanistic interpretation** — which step (induction, import, editing)
+     looks rate-limiting, and why, based on the pathway intermediate curves.
+  3. **Therapeutic relevance** — how this maps to the disease in question and
+     what a wet-lab follow-up should focus on.
+  4. **Caveats** — at least one specific limitation of the in silico model
+     (e.g. mtDNA replication / mitophagy dynamics, off-target prediction
+     fidelity, dox pharmacokinetics in vivo).
+
+Use precise scientific language. No emojis, no bullet preamble — write as
+flowing paragraphs. Aim for 250-400 words total."""
+
+    with _client().messages.stream(
+        model=MODEL,
+        max_tokens=2000,
+        thinking={"type": "adaptive"},
+        system=[
+            {
+                "type": "text",
+                "text": SCIENCE_PRIMER,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_msg}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+
+
+# ---------------------------------------------------------------------------
+# 2. Wet-lab protocol generation (streaming)
+# ---------------------------------------------------------------------------
+
+def stream_protocol(
+    region: dict,
+    design: dict,
+    prediction: dict,
+    best_doses: list[dict],
+    best_simulation: dict,
+) -> Iterator[str]:
+    """Stream a Markdown wet-lab protocol tailored to the optimization run."""
+    dose_lines = "\n".join(
+        f"  - t = {d['time']:.1f} h, bolus = {d['amount']:.2f} a.u."
+        for d in best_doses
+    )
+    sim_summary = _summarise_sim(best_simulation)
+
+    user_msg = f"""Generate a detailed wet-lab protocol in Markdown for validating
+the Revitalize AI prediction below. The protocol is for a graduate-level
+mitochondrial biology lab.
+
+TARGET
+  Locus:    {region.get('name')}
+  Disease:  {region.get('disease')}
+  Variant:  m.{region.get('position')}{region.get('wt')}>{region.get('edit')}
+
+GUIDE DESIGN
+  Spacer:        {design['spacer']}
+  PAM:           {design['pam']}
+  pegRNA 3' ext: {design['pegrna_3p']}
+  ML efficiency: {prediction['on_target']*100:.1f}%   off-target: {prediction['off_target_risk']*100:.1f}%
+
+OPTIMIZED DOX SCHEDULE (in vitro, 96 h)
+{dose_lines}
+
+PREDICTED RESULT
+{sim_summary}
+
+Produce a Markdown document with the following sections, in this order:
+
+  ## Aim
+  ## Materials
+     - cell line(s), media, reagents with vendor + catalog numbers where
+       canonical (e.g. Dulbecco's MEM, ThermoFisher 11965-092)
+     - plasmids: list the safe-harbor knock-in construct, the dox-inducible
+       cassette, the pegRNA/guide vectors
+     - doxycycline working stock concentration
+  ## Day-by-day procedure (Days 1-7)
+     - Day 1: cell seeding and transfection / nucleofection
+     - Day 2: integration validation
+     - Day 3: dox induction begins (use the schedule above, converted to
+       µg/mL doxycycline — assume 1 a.u. ≈ 1 µg/mL in the simulator)
+     - Day 4-5: additional dox doses as scheduled
+     - Day 6: harvest
+     - Day 7: readout
+  ## Readouts
+     - qPCR heteroplasmy quantification (ARMS-qPCR or ddPCR)
+     - Sanger / NGS confirmation of the edit
+     - Functional assay appropriate to the disease (e.g. lactate / pyruvate
+       ratio for MELAS, complex V activity for NARP, complex I activity for LHON)
+  ## Controls
+     - Untreated, dox-only, scrambled-pegRNA, no-PNPase-tag
+  ## Expected outcome
+     - Reference the simulation's predicted final pathogenic heteroplasmy
+  ## Troubleshooting
+     - Three common failure modes specific to this kind of experiment
+
+Use precise quantities (volumes in µL or mL, concentrations in nM or µg/mL,
+incubation times). Format with Markdown headings, sub-bullets, and tables
+where appropriate. No emojis. Aim for ~800-1200 words."""
+
+    with _client().messages.stream(
+        model=MODEL,
+        max_tokens=4000,
+        thinking={"type": "adaptive"},
+        system=[
+            {
+                "type": "text",
+                "text": SCIENCE_PRIMER,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_msg}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+
+
+# ---------------------------------------------------------------------------
+# 3. Natural-language scenario parser (tool use → structured params)
+# ---------------------------------------------------------------------------
+
+SCENARIO_TOOL = {
+    "name": "set_simulation_params",
+    "description": (
+        "Configure the Revitalize simulator with concrete numeric parameters "
+        "extracted from a natural-language scenario description."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "region": {
+                "type": "string",
+                "enum": [
+                    "MT-TL1 (MELAS m.3243A>G)",
+                    "MT-ATP6 (NARP m.8993T>G)",
+                    "MT-ND1 (LHON m.3460G>A)",
+                    "MT-ND4 (LHON m.11778G>A)",
+                ],
+                "description": "Pathogenic mtDNA locus to target.",
+            },
+            "initial_heteroplasmy": {
+                "type": "number",
+                "minimum": 0.05,
+                "maximum": 0.99,
+                "description": "Initial pathogenic mtDNA fraction (0-1).",
+            },
+            "duration_h": {
+                "type": "number",
+                "minimum": 24,
+                "maximum": 240,
+                "description": "Simulation duration in hours.",
+            },
+            "dose_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "description": "Number of dox doses.",
+            },
+            "dose_interval_h": {
+                "type": "number",
+                "minimum": 4,
+                "maximum": 48,
+                "description": "Interval between doses (hours).",
+            },
+            "dose_amount": {
+                "type": "number",
+                "minimum": 0.2,
+                "maximum": 3.5,
+                "description": "Amplitude per dose bolus (arbitrary units; ~1.0 is typical).",
+            },
+            "rationale": {
+                "type": "string",
+                "description": (
+                    "One sentence explaining how you mapped the user's "
+                    "description to these parameters. Cite the specific phrase "
+                    "that informed each non-default choice."
+                ),
+            },
+        },
+        "required": [
+            "region",
+            "initial_heteroplasmy",
+            "duration_h",
+            "dose_count",
+            "dose_interval_h",
+            "dose_amount",
+            "rationale",
+        ],
+    },
+}
+
+
+def parse_scenario(description: str) -> dict:
+    """Use Claude tool-use to convert a natural-language scenario to params.
+
+    Returns a dict with keys: region, initial_heteroplasmy, duration_h,
+    doses (list of {time, amount}), rationale.
+    """
+    response = _client().messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        # NB: thinking cannot be combined with a forced tool_choice on Opus 4.7
+        tools=[SCENARIO_TOOL],
+        tool_choice={"type": "tool", "name": "set_simulation_params"},
+        system=[
+            {
+                "type": "text",
+                "text": SCIENCE_PRIMER,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Convert this scenario into concrete simulator parameters. "
+                    "Be conservative — favour realistic clinical defaults when "
+                    "the description is vague.\n\nScenario:\n" + description
+                ),
+            }
+        ],
+    )
+
+    for block in response.content:
+        if block.type == "tool_use":
+            params = block.input
+            doses = [
+                {
+                    "time": i * params["dose_interval_h"],
+                    "amount": params["dose_amount"],
+                }
+                for i in range(params["dose_count"])
+            ]
+            return {
+                "region": params["region"],
+                "initial_heteroplasmy": params["initial_heteroplasmy"],
+                "duration_h": params["duration_h"],
+                "doses": doses,
+                "rationale": params["rationale"],
+            }
+    raise RuntimeError("Claude did not return a tool_use block")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _summarise_sim(sim: dict) -> str:
+    """Compact text representation of a SimResult for prompts."""
+    t = sim.get("t", [])
+    if not t:
+        return "  (no trajectory data)"
+    pat = sim.get("pathogenic_heteroplasmy", [])
+    edited = sim.get("edited_fraction", [])
+    return (
+        f"  Duration:               {t[-1]:.0f} h, {len(t)} samples\n"
+        f"  Initial pathogenic load: {pat[0]*100:.1f}%\n"
+        f"  Final pathogenic load:   {sim['final_pathogenic']*100:.1f}%\n"
+        f"  Final edited fraction:   {sim['final_edited']*100:.1f}%\n"
+        f"  Time to 60% rescue:      "
+        + (
+            f"{sim['therapeutic_threshold_h']:.1f} h"
+            if sim.get("therapeutic_threshold_h") is not None
+            else "not reached"
+        )
+        + "\n"
+        f"  Cumulative dox AUC:      {sim['dox_auc']:.1f}"
+    )

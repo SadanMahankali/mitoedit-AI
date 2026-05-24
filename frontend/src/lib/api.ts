@@ -73,7 +73,122 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type OffTargetHit = {
+  position: number;
+  strand: "+" | "-";
+  mismatches: number;
+  score: number;
+  gene: string;
+  on_target: boolean;
+};
+
+export type OffTargetResult = {
+  genome: {
+    length_bp: number;
+    genes: { name: string; start: number; end: number; color: string }[];
+  };
+  hits: OffTargetHit[];
+};
+
+export type AgingInputs = {
+  starting_bio_age_years: number;
+  mito_count: number;
+  somatic_mutation_rate: number;
+  fission_fusion_ratio: number;
+  membrane_potential_mV: number;
+  mitophagy_efficiency: number;
+  insoluble_protein_pct: number;
+  membrane_lipid_nmol: number;
+  matrix_calcium_nM: number;
+};
+
+export type AgingResult = {
+  t: number[];
+  heteroplasmy: number[];
+  treated_rate_per_hr: number[];
+  untreated_rate_per_hr: number[];
+  treated_bio_age: number[];
+  untreated_bio_age: number[];
+  contributions_per_hr: Record<string, number>;
+  summary: {
+    starting_bio_age: number;
+    treated_final_bio_age: number;
+    untreated_final_bio_age: number;
+    years_saved: number;
+    duration_h: number;
+    duration_days: number;
+  };
+};
+
+export type ScenarioResult = {
+  region: string;
+  initial_heteroplasmy: number;
+  duration_h: number;
+  doses: Dose[];
+  rationale: string;
+};
+
+async function streamText(
+  path: string,
+  body: unknown,
+  onChunk: (chunk: string) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`Stream ${path} failed: ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    onChunk(decoder.decode(value, { stream: true }));
+  }
+}
+
 export const api = {
+  streamInterpret: (
+    body: {
+      region: Region;
+      design: Design;
+      prediction: Prediction;
+      simulation: SimResult;
+    },
+    onChunk: (c: string) => void,
+    signal?: AbortSignal,
+  ) => streamText("/interpret", body, onChunk, signal),
+  streamProtocol: (
+    body: {
+      region: Region;
+      design: Design;
+      prediction: Prediction;
+      best_doses: Dose[];
+      best_simulation: SimResult;
+    },
+    onChunk: (c: string) => void,
+    signal?: AbortSignal,
+  ) => streamText("/protocol", body, onChunk, signal),
+  offtargets: (spacer: string, max_mismatches = 4, top_n = 60) =>
+    jsonFetch<OffTargetResult>("/offtargets", {
+      method: "POST",
+      body: JSON.stringify({ spacer, max_mismatches, top_n }),
+    }),
+  aging: (body: AgingInputs & { t: number[]; heteroplasmy: number[] }) =>
+    jsonFetch<AgingResult>("/aging", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  scenario: (description: string) =>
+    jsonFetch<ScenarioResult>("/scenario", {
+      method: "POST",
+      body: JSON.stringify({ description }),
+    }),
   regions: () => jsonFetch<{ regions: Region[] }>("/regions"),
   design: (name: string) =>
     jsonFetch<Design>(`/design/${encodeURIComponent(name)}`),

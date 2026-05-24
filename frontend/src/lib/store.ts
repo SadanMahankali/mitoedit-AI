@@ -3,8 +3,11 @@ import { create } from "zustand";
 import type { Design, Dose, OptResult, Prediction, Region, SimResult } from "./api";
 
 export type Phase = "idle" | "loading" | "ready" | "error";
+export type View = "landing" | "dashboard";
 
 interface AppState {
+  view: View;
+  setView: (v: View) => void;
   regions: Region[];
   selectedRegion: string | null;
   design: Design | null;
@@ -32,6 +35,8 @@ interface AppState {
 }
 
 export const useApp = create<AppState>((set) => ({
+  view: "landing",
+  setView: (v) => set({ view: v }),
   regions: [],
   selectedRegion: null,
   design: null,

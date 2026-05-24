@@ -7,3 +7,5 @@ torch==2.4.1
 optuna==4.0.0
 scikit-learn==1.5.2
 biopython==1.84
+anthropic==0.71.0
+python-dotenv==1.0.1
